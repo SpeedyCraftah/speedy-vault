@@ -8,19 +8,28 @@ import (
 	"os"
 	"speedyvault/src/config"
 	"speedyvault/src/handlers"
+	. "speedyvault/src/handlers/constants"
 	"speedyvault/src/routes/middleware"
 
 	"github.com/valyala/fasthttp"
+	"github.com/zeebo/blake3"
 )
 
 func BucketUpload(ctx* fasthttp.RequestCtx) {
-	bucket := middleware.AuthorizeBucketAPIRequest(ctx);
+	bucket, access := middleware.AuthorizeBucketAPIRequest(ctx);
 	if bucket == nil {
 		ctx.SetConnectionClose();
 		return;
 	}
 
-	key := string(ctx.Path());
+	// Check if the context is even allowed any of the possible operations.
+	if !access.HasAny(ObjectCreate | ObjectUpdate) {
+		middleware.PermissionDeniedAccess(ctx);
+		ctx.SetConnectionClose();
+		return;
+	}
+
+	key := ctx.Path();
 	stream := ctx.Request.BodyStream();
 
 	objectId := handlers.Misc.NewRandomUID();
@@ -35,9 +44,11 @@ func BucketUpload(ctx* fasthttp.RequestCtx) {
 		return;
 	}
 	
+	hasher := blake3.New();
+	
 	// Receive the file in chunks and stream directly to the file.
 	streamBuffer := make([]byte, config.AppConfig.UploadStreamingChunkSize);
-	var bytesReceived int = 0;
+	var bytesReceived uint64 = 0;
 	for {
 		bytesRead, err := stream.Read(streamBuffer);
 		if err != nil && err != io.EOF {
@@ -50,7 +61,7 @@ func BucketUpload(ctx* fasthttp.RequestCtx) {
 		}
 
 		// Count the total bytes received, return 413 if over limit.
-		bytesReceived += bytesRead;
+		bytesReceived += uint64(bytesRead);
 		if bytesReceived > config.AppConfig.MaxSinglePartSize {
 			file.Close();
 			os.Remove(objectFilePath);
@@ -59,8 +70,10 @@ func BucketUpload(ctx* fasthttp.RequestCtx) {
 			return;
 		}
 
+		bufferSlice := streamBuffer[0:bytesRead];
+		
 		// Stream the bytes into the file.
-		if _, err := file.Write(streamBuffer[0:bytesRead]); err != nil {
+		if _, err := file.Write(bufferSlice); err != nil {
 			file.Close();
 			os.Remove(objectFilePath);
 			log.Println(err);
@@ -68,6 +81,9 @@ func BucketUpload(ctx* fasthttp.RequestCtx) {
 			ctx.SetConnectionClose();
 			return;
 		}
+
+		// Add the buffer bytes into the digest (returns an error but the package always returns a hardcoded nil).
+		hasher.Write(bufferSlice);
 
 		// If we've received everything.
 		if err == io.EOF {
@@ -85,7 +101,7 @@ func BucketUpload(ctx* fasthttp.RequestCtx) {
 	}
 	
 	// Store the object in the database.
-	isCreated, err := handlers.Object.CreateOrReplaceObject(bucket, objectId, derivedContentType, key);
+	isCreated, err := handlers.Object.CreateOrReplaceObject(bucket, objectId, derivedContentType, hasher.Sum(nil), bytesReceived, key);
 	if err != nil {
 		// Clean up the downloaded file if one was provided.
 		os.Remove(objectFilePath);

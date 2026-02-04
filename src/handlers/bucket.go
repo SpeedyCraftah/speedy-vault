@@ -1,13 +1,14 @@
 package handlers
 
 import (
-	"crypto/sha256"
+	"crypto/sha512"
 	"database/sql"
 	"encoding/base64"
 	"log"
 	"path"
 	"regexp"
 	"speedyvault/src/config"
+	. "speedyvault/src/handlers/constants"
 	"strconv"
 	"sync"
 	"time"
@@ -19,6 +20,7 @@ type CachedBucket struct {
 
 	cachedMs int64;
 	APIKeys CachedBucketAPIKeyStore;
+	ObjectAuth CachedBucketObjectAuthStore;
 	AccessRules []*CachedBucketAccessRule;
 }
 
@@ -26,11 +28,11 @@ func (b CachedBucket) GetObjectPath(objectId string) string {
 	return path.Join(config.AppConfig.DataDirectory, strconv.FormatInt(b.id, 10), "objects", objectId);
 }
 
-func (b CachedBucket) GetKeyAccessCondition(key string) BucketAccessRuleAction {
+func (b CachedBucket) GetKeyAccessCondition(key []byte) BucketAccessRuleAction {
 	// Attempt to find a rule that matches this key, and returns its outcome.
 	for _, rule := range b.AccessRules {
-		if rule.regex.MatchString(key) {
-			return rule.action;
+		if rule.Regex.Match(key) {
+			return rule.Action;
 		}
 	}
 
@@ -38,43 +40,46 @@ func (b CachedBucket) GetKeyAccessCondition(key string) BucketAccessRuleAction {
 	return AllowSigned;
 }
 
-
-type BucketAccessRuleAction uint8;
-const (
-	AllowPublic BucketAccessRuleAction = iota; // Allow access to everyone, no matter if the URL is signed or not (effectively public access).
-	AllowSigned; // Allow access only if the URL is signed and the signature is valid and hasn't expired (discretionary access), this is also the default behaviour if no rule is matched.
-	DenyAll; // Blocks access outright regardless of if the URL is signed or not, you can also use it to override the default AllowSigned rule and block all access by placing it at the end matching all keys.
-);
-
 type CachedBucketAccessRule struct {
 	id int64;
 	
-	regex *regexp.Regexp;
-	action BucketAccessRuleAction;
+	Regex *regexp.Regexp;
+	Action BucketAccessRuleAction;
 }
 
 type CachedBucketAPIKeyStore struct {
-	cache map[[32]byte]*CachedBucketAPIKey;
+	cache map[[64]byte]*CachedBucketAPIKey;
 }
 
 func (store CachedBucketAPIKeyStore) Get(b64Key []byte) *CachedBucketAPIKey {
-	// Our keys are always SHA256 digests (32 bytes after decoding), meaning we can make an assumption on the buffer size and error if incorrect.
-	if base64.RawStdEncoding.DecodedLen(len(b64Key)) != 32 {
+	// Our keys are always SHA512 digests (64 bytes after decoding), meaning we can make an assumption on the buffer size and error if incorrect.
+	if base64.RawStdEncoding.DecodedLen(len(b64Key)) != 64 {
 		return nil;
 	}
 
-	rawKey := make([]byte, 32);
+	rawKey := make([]byte, 64);
 	if _, err := base64.RawStdEncoding.Decode(rawKey, b64Key); err != nil {
 		return nil;
 	}
 
 	// Safety: API keys are read-only, hence no locking is required.
-	return store.cache[sha256.Sum256(rawKey)];
+	return store.cache[sha512.Sum512(rawKey)];
 }
 
 type CachedBucketAPIKey struct {
 	id int64;
 	createdMs int64;
+}
+
+type CachedBucketObjectAuthStore struct {
+	MAC map[uint32]*CachedBucketObjectAuthMAC;
+}
+
+type CachedBucketObjectAuthMAC struct {
+	id int64;
+	createdMs int64;
+
+	Secret []byte; 
 }
 
 
@@ -105,6 +110,28 @@ func (BucketHandler) GetBucketByName(name string) (*CachedBucket, error) {
 	// Assign the time of caching.
 	bucket.cachedMs = time.Now().UnixMilli();
 
+	// Fetch the MAC secrets and selectors for this bucket.
+	bucket.ObjectAuth.MAC = make(map[uint32]*CachedBucketObjectAuthMAC);
+	objectAuthMACRows, err := DB.Query("SELECT id,selector,secret,created_ms FROM bucket_object_auth_mac WHERE bucket_id = ?", bucket.id);
+	if err != nil {
+		log.Println("Problem while fetching bucket object MAC authentication entries from database ", err);
+		return nil, err;
+	}
+
+	for objectAuthMACRows.Next() {
+		entry := CachedBucketObjectAuthMAC{};
+		var selector uint32;
+		if err := objectAuthMACRows.Scan(&entry.id, &selector, &entry.Secret, &entry.createdMs); err != nil {
+			objectAuthMACRows.Close();
+			log.Println("Problem while reading bucket object MAC authentication entries from database ", err);
+			return nil, err;
+		}
+
+		bucket.ObjectAuth.MAC[selector] = &entry;
+	}
+
+	objectAuthMACRows.Close();
+
 	// Fetch the access rule priorities for this bucket (if any).
 	bucket.AccessRules = []*CachedBucketAccessRule{};
 	accessRuleRows, err := DB.Query("SELECT id,regex,action FROM bucket_access_rules WHERE bucket_id = ? ORDER BY priority ASC", bucket.id);
@@ -116,14 +143,14 @@ func (BucketHandler) GetBucketByName(name string) (*CachedBucket, error) {
 	for accessRuleRows.Next() {
 		rule := CachedBucketAccessRule{};
 		var rawRegex string;
-		if err := accessRuleRows.Scan(&rule.id, &rawRegex, &rule.action); err != nil {
+		if err := accessRuleRows.Scan(&rule.id, &rawRegex, &rule.Action); err != nil {
 			accessRuleRows.Close();
 			log.Println("Problem while reading bucket access rules from database ", err);
 			return nil, err;
 		}
 
 		// Regex would've been validated at insertion time, so fine to panic on error.
-		rule.regex = regexp.MustCompile(rawRegex);
+		rule.Regex = regexp.MustCompile(rawRegex);
 
 		// Add to the rule list (already in highest to lowest priority order from database).
 		bucket.AccessRules = append(bucket.AccessRules, &rule);
@@ -137,7 +164,7 @@ func (BucketHandler) GetBucketByName(name string) (*CachedBucket, error) {
 	accessRuleRows.Close();
 
 	// Fetch the API keys for this bucket (if any).
-	bucket.APIKeys = CachedBucketAPIKeyStore{ cache: make(map[[32]byte]*CachedBucketAPIKey) };
+	bucket.APIKeys = CachedBucketAPIKeyStore{ cache: make(map[[64]byte]*CachedBucketAPIKey) };
 	apiKeyRows, err := DB.Query("SELECT id,created_ms,key_hashed FROM bucket_auth_api_keys WHERE bucket_id = ?", bucket.id);
 	if err != nil {
 		log.Println("Problem while fetching bucket API keys from database ", err);
@@ -153,7 +180,7 @@ func (BucketHandler) GetBucketByName(name string) (*CachedBucket, error) {
 			return nil, err;
 		}
 
-		var hashedAPIKey [32]byte;
+		var hashedAPIKey [64]byte;
 		copy(hashedAPIKey[:], hashedAPIKeyBlob);
 
 		bucket.APIKeys.cache[hashedAPIKey] = &key;
@@ -196,7 +223,7 @@ func (BucketHandler) InitDBTables() {
 			bucket_id INTEGER NOT NULL,
 			name VARCHAR(64) UNIQUE NOT NULL,
 			created_ms UNSIGNED BIGINT NOT NULL,
-			key_hashed BLOB(32) NOT NULL,
+			key_hashed BLOB(64) NOT NULL,
 
 			FOREIGN KEY (bucket_id) REFERENCES buckets (id) ON DELETE CASCADE
 		)
@@ -234,6 +261,24 @@ func (BucketHandler) InitDBTables() {
 		log.Fatal("Error while creating bucket access rules index ", err);
 	}
 
+	_, err = DB.Exec(`
+		CREATE TABLE IF NOT EXISTS bucket_object_auth_mac (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			bucket_id INTEGER NOT NULL,
+
+			created_ms UNSIGNED BIGINT NOT NULL,
+			selector UNSIGNED INTEGER NOT NULL,
+			secret BLOB(32) NOT NULL,
+
+			FOREIGN KEY (bucket_id) REFERENCES buckets (id) ON DELETE CASCADE,
+			UNIQUE (bucket_id, selector)
+		)
+	`);
+
+	if err != nil {
+		log.Fatal("Error while creating bucket object auth mac table ", err);
+	}
+
 	// Test rows.
 
 	if config.DEBUG_MODE {
@@ -241,9 +286,13 @@ func (BucketHandler) InitDBTables() {
 			log.Fatal("Error while inserting bucket test row ", err);
 		}
 
-		keyHash := sha256.Sum256([]byte("canttouchthis"));
+		keyHash := sha512.Sum512([]byte("canttouchthiscanttouchthissomemrcanttouchthiscanttouchthissomemr"));
 		if _, err := DB.Exec("INSERT INTO bucket_auth_api_keys(bucket_id,name,created_ms,key_hashed) VALUES(?,?,?,?)", 1, "Test Key", time.Now().UnixMilli(), keyHash[:]); err != nil {
 			log.Fatal("Error while inserting bucket API key test row ", err);
+		}
+
+		if _, err := DB.Exec("INSERT INTO bucket_object_auth_mac(bucket_id,selector,secret,created_ms) VALUES(?,?,?,?)", 1, 1, "supersecretobjectsecretthatis32b", time.Now().UnixMilli()); err != nil {
+			log.Fatal("Error while inserting bucket object auth MAC test row ", err);
 		}
 	}
 }
