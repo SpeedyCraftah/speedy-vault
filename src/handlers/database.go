@@ -8,43 +8,45 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 )
 
-var DB *sql.DB;
+var DB *sql.DB
 
 func (DatabaseHandler) InitDatabase() {
-	var dbPath string;
+	var dbPath string
 	if config.DEBUG_MODE {
-		dbPath = ":memory:";
+		dbPath = ":memory:"
 	} else {
-		dbPath = "database.sqlite";
+		dbPath = "database.sqlite"
 	}
-	
-	var err error;
-	DB, err = sql.Open("sqlite3", dbPath);
+
+	var err error
+	DB, err = sql.Open("sqlite3", dbPath+"?_busy_timeout=5000")
 	if err != nil {
-		log.Fatal("Could not open database connection", err);
+		log.Fatal("Could not open database connection", err)
 	}
 
 	// Disable opening more than one concurrent connection with an in-memory database as it causes a new memory instance to be created each time.
 	if dbPath == ":memory:" {
-		DB.SetMaxOpenConns(1);
+		DB.SetMaxOpenConns(1)
 	}
-	
+
 	// Enable foreign key enforcement.
 	if _, err = DB.Exec("PRAGMA foreign_keys = ON;"); err != nil {
-		log.Fatal("Could not set foreign key pragma", err);
+		log.Fatal("Could not set foreign key pragma", err)
 	}
-	
+
 	// Enable WAL mode.
 	if _, err = DB.Exec("PRAGMA journal_mode = WAL;"); err != nil {
-		log.Fatal("Could not set WAL mode pragma", err);
+		log.Fatal("Could not set WAL mode pragma", err)
 	}
 
 	// Initialize the handler tables.
-	Bucket.InitDBTables();
-	Object.InitDBTables();
-	
-	log.Println("Successfully initialized database connection and tables");
+	Bucket.InitDBTables()
+	File.InitDBTables()
+	Object.InitDBTables()
+
+	log.Println("Successfully initialized database connection and tables")
 }
 
-type DatabaseHandler struct{};
-var Database = DatabaseHandler{};
+type DatabaseHandler struct{}
+
+var Database = DatabaseHandler{}
